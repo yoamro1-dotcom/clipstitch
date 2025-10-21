@@ -1,40 +1,100 @@
 import os
+import json
 import math
+import shlex
 import tempfile
+import subprocess
 import textwrap
 from dataclasses import dataclass
-from typing import Tuple, Optional
-
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from typing import Optional, Tuple
 
 import streamlit as st
-from moviepy.editor import (
-    VideoFileClip,
-    CompositeVideoClip,
-    clips_array,
-    concatenate_videoclips,
-    ImageClip,
-)
+import imageio
+import imageio_ffmpeg
+from PIL import Image, ImageDraw, ImageFont
 
 
-# --------------------
-# Helpers
-# --------------------
-def _safe_int_even(x: int) -> int:
-    """Make sure dimension is an even integer for H.264 compatibility."""
-    x = int(max(2, round(x)))
+# --------------------------
+# FFmpeg utilities
+# --------------------------
+def get_ffmpeg_path() -> str:
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+def get_ffprobe_path() -> Optional[str]:
+    ffmpeg_path = get_ffmpeg_path()
+    d = os.path.dirname(ffmpeg_path)
+    candidates = [os.path.join(d, "ffprobe"), os.path.join(d, "ffprobe.exe")]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    # Some builds put ffprobe in PATH; try bare name
+    return "ffprobe"
+
+def run_cmd(cmd: list) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True)
+
+def probe_video_dims(path: str) -> Tuple[int, int]:
+    """
+    Returns (width, height) of the first video stream using ffprobe, falling back to imageio.
+    """
+    ffprobe = get_ffprobe_path()
+    try:
+        # Try ffprobe JSON
+        cmd = [
+            ffprobe, "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json", path
+        ]
+        proc = run_cmd(cmd)
+        if proc.returncode == 0 and proc.stdout:
+            data = json.loads(proc.stdout)
+            streams = data.get("streams", [])
+            if streams:
+                w = int(streams[0]["width"])
+                h = int(streams[0]["height"])
+                return w, h
+    except Exception:
+        pass
+
+    # Fallback to imageio
+    try:
+        rdr = imageio.get_reader(path)
+        meta = rdr.get_meta_data()
+        size = meta.get("size")
+        if size:
+            w, h = size
+            rdr.close()
+            return int(w), int(h)
+        rdr.close()
+    except Exception:
+        pass
+
+    # Worst-case fallback
+    return 1920, 1080
+
+def even(x: int) -> int:
+    x = int(round(x))
     return x if x % 2 == 0 else x - 1
 
+def hex_to_rgb_tuple(hex_str: str) -> Tuple[int, int, int]:
+    h = hex_str.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
-def _load_font(font_size: int) -> ImageFont.FreeTypeFont:
-    """Attempt to load a decent font; fall back to default if not available."""
-    candidate_paths = [
+def rgb_to_ffmpeg_hex(rgb: Tuple[int, int, int]) -> str:
+    # FFmpeg color format e.g., 0xRRGGBB
+    return "0x{0:02x}{1:02x}{2:02x}".format(*rgb)
+
+
+# --------------------------
+# Overlay text image (Pillow)
+# --------------------------
+def load_font(font_size: int) -> ImageFont.FreeTypeFont:
+    candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     ]
-    for p in candidate_paths:
+    for p in candidates:
         if os.path.exists(p):
             try:
                 return ImageFont.truetype(p, font_size)
@@ -42,106 +102,84 @@ def _load_font(font_size: int) -> ImageFont.FreeTypeFont:
                 pass
     return ImageFont.load_default()
 
-
-def _render_center_text_image(
+def render_center_text_overlay_png(
     text: str,
-    frame_size: Tuple[int, int],
-    font_size: int = 48,
-    text_color: str = "#FFFFFF",
-    bg_color: str = "#000000",
-    bg_opacity: float = 0.45,
+    frame_w: int,
+    frame_h: int,
+    font_size: int,
+    text_color: str,
+    bg_color: str,
+    bg_opacity: float,
     max_width_ratio: float = 0.8,
     padding_px: int = 24,
     line_spacing: float = 1.1,
 ) -> Image.Image:
     """
-    Create an RGBA image with centered text and a semi-transparent rounded rectangle behind it.
+    Returns a small RGBA image (only the pill + text) to be overlaid at center.
+    Its width is capped at max_width_ratio * frame_w.
     """
-    w, h = frame_size
-    W = int(w * max_width_ratio)
+    max_w = max(50, int(frame_w * max_width_ratio))
+    font = load_font(font_size)
 
-    font = _load_font(font_size)
-
-    # Wrap text to fit width W
-    # Approximate wrap width by measuring average char width
+    # Wrap text using a rough char-width estimate
     try:
         bbox_M = font.getbbox("M")
         avg_char_w = max(1, bbox_M[2] - bbox_M[0])
     except Exception:
         avg_char_w = max(1, int(font_size * 0.6))
+    max_chars = max(1, int(max_w / avg_char_w))
 
-    max_chars = max(1, int(W / avg_char_w))
-    wrapped = []
+    lines = []
     for para in text.split("\n"):
-        lines = textwrap.wrap(para, width=max_chars)
-        wrapped.extend(lines if lines else [""])
+        wrapped = textwrap.wrap(para, width=max_chars)
+        lines.extend(wrapped if wrapped else [""])
 
-    # Measure text block
-    draw_dummy = ImageDraw.Draw(Image.new("RGB", (10, 10)))
-    line_heights = []
-    line_widths = []
-    for line in wrapped:
-        bbox = draw_dummy.textbbox((0, 0), line, font=font)
-        line_widths.append(bbox[2] - bbox[0])
-        line_heights.append(bbox[3] - bbox[1])
-
-    if not line_heights:
-        line_heights = [font_size]
-        line_widths = [font_size]
-
-    text_block_w = max(line_widths)
-    text_block_h = sum(line_heights)
-    # Add spacing between lines
+    # Measure lines
+    dummy = Image.new("RGB", (10, 10))
+    draw_dummy = ImageDraw.Draw(dummy)
+    line_sizes = [draw_dummy.textbbox((0, 0), ln, font=font) for ln in lines]
+    line_widths = [(b[2] - b[0]) for b in line_sizes]
+    line_heights = [(b[3] - b[1]) for b in line_sizes]
+    text_w = max(line_widths) if line_widths else font_size
+    text_h = sum(line_heights) if line_heights else font_size
     if len(line_heights) > 1:
-        text_block_h += int((len(line_heights) - 1) * font_size * (line_spacing - 1.0))
+        text_h += int((len(line_heights) - 1) * font_size * (line_spacing - 1.0))
 
-    # Create transparent canvas
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    # Canvas for pill + text (tight bounding box)
+    rect_w = text_w + padding_px * 2
+    rect_h = text_h + padding_px * 2
+
+    img = Image.new("RGBA", (rect_w, rect_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
     # Background rounded rectangle
-    rect_w = text_block_w + padding_px * 2
-    rect_h = text_block_h + padding_px * 2
-    rect_x0 = (w - rect_w) // 2
-    rect_y0 = (h - rect_h) // 2
-    rect_x1 = rect_x0 + rect_w
-    rect_y1 = rect_y0 + rect_h
+    bg_rgb = hex_to_rgb_tuple(bg_color)
+    a = max(0, min(255, round(255 * float(bg_opacity))))
     radius = int(min(rect_w, rect_h) * 0.12)
-
-    # Convert bg_color hex to RGBA with opacity
-    bg_hex = bg_color.lstrip("#")
-    r = int(bg_hex[0:2], 16)
-    g = int(bg_hex[2:4], 16)
-    b = int(bg_hex[4:6], 16)
-    a = int(max(0, min(255, round(255 * bg_opacity))))
-
     try:
-        draw.rounded_rectangle([rect_x0, rect_y0, rect_x1, rect_y1], radius=radius, fill=(r, g, b, a))
+        draw.rounded_rectangle([0, 0, rect_w, rect_h], radius=radius, fill=(bg_rgb[0], bg_rgb[1], bg_rgb[2], a))
     except Exception:
-        draw.rectangle([rect_x0, rect_y0, rect_x1, rect_y1], fill=(r, g, b, a))
+        draw.rectangle([0, 0, rect_w, rect_h], fill=(bg_rgb[0], bg_rgb[1], bg_rgb[2], a))
 
-    # Draw wrapped text
-    txt_hex = text_color.lstrip("#")
-    tr = int(txt_hex[0:2], 16)
-    tg = int(txt_hex[2:4], 16)
-    tb = int(txt_hex[4:6], 16)
-
-    tx = rect_x0 + padding_px
-    ty = rect_y0 + padding_px
-
-    for i, line in enumerate(wrapped):
-        draw.text((tx, ty), line, font=font, fill=(tr, tg, tb, 255))
-        line_h = line_heights[i]
-        ty += int(line_h * line_spacing)
+    # Text
+    txt_rgb = hex_to_rgb_tuple(text_color)
+    x = padding_px
+    y = padding_px
+    for i, line in enumerate(lines):
+        draw.text((x, y), line, font=font, fill=(txt_rgb[0], txt_rgb[1], txt_rgb[2], 255))
+        y += int(line_heights[i] * line_spacing)
 
     return img
 
 
+# --------------------------
+# Filter builders
+# --------------------------
 @dataclass
 class ExportOptions:
-    layout: str               # 'side_by_side' | 'stacked' | 'sequential'
-    target_height: int        # final output height
-    max_width: Optional[int]  # optional cap on width
+    layout: str                # 'sbs' | 'stack' | 'seq'
+    target_height: int         # used by 'sbs' & 'seq'
+    target_width: int          # used by 'stack'
     show_divider: bool
     divider_color: str
     overlay_text: str
@@ -149,250 +187,110 @@ class ExportOptions:
     text_color: str
     text_bg_color: str
     text_bg_opacity: float
-    audio_source: str         # 'pre' | 'post' | 'none'
-    fps: Optional[int]
+    audio_mode: str            # 'pre' | 'post' | 'concat' | 'none'
+    fps: int
+
+def build_filters_side_by_side(
+    pre_w, pre_h, post_w, post_h, H, show_divider, divider_hex
+):
+    preW = even(pre_w * H / pre_h)
+    postW = even(post_w * H / post_h)
+    preW, postW, H = int(preW), int(postW), even(H)
+    div_w = int(max(2, round(0.004 * (preW + postW)))) if show_divider else 0
+
+    parts = []
+    parts.append(f"[0:v]scale={preW}:{H}:flags=lanczos,setsar=1[v0]")
+    parts.append(f"[1:v]scale={postW}:{H}:flags=lanczos,setsar=1[v1]")
+    if show_divider:
+        parts.append(f"color=c={divider_hex}:s={div_w}x{H}[div]")
+        parts.append(f"[v0][div][v1]hstack=inputs=3[base]")
+    else:
+        parts.append(f"[v0][v1]hstack=inputs=2[base]")
+    out_w = preW + postW + (div_w if show_divider else 0)
+    out_h = H
+    # overlay later: [base][2:v]overlay=...
+    return ";".join(parts), out_w, out_h
+
+def build_filters_stacked(
+    pre_w, pre_h, post_w, post_h, W, show_divider, divider_hex
+):
+    W = even(W)
+    preH = even(pre_h * W / pre_w)
+    postH = even(post_h * W / post_w)
+    preH, postH = int(preH), int(postH)
+    div_h = int(max(2, round(0.004 * (preH + postH)))) if show_divider else 0
+
+    parts = []
+    parts.append(f"[0:v]scale={W}:{preH}:flags=lanczos,setsar=1[v0]")
+    parts.append(f"[1:v]scale={W}:{postH}:flags=lanczos,setsar=1[v1]")
+    if show_divider:
+        parts.append(f"color=c={divider_hex}:s={W}x{div_h}[div]")
+        parts.append(f"[v0][div][v1]vstack=inputs=3[base]")
+    else:
+        parts.append(f"[v0][v1]vstack=inputs=2[base]")
+    out_w = W
+    out_h = preH + postH + (div_h if show_divider else 0)
+    return ";".join(parts), out_w, out_h
+
+def build_filters_sequential(
+    pre_w, pre_h, post_w, post_h, H, audio_mode
+):
+    H = even(H)
+    preW = even(pre_w * H / pre_h)
+    postW = even(post_w * H / post_h)
+    finalW = int(max(preW, postW))
+
+    parts = []
+    parts.append(f"[0:v]scale={int(preW)}:{H}:flags=lanczos,setsar=1,pad={finalW}:{H}:(ow-iw)/2:(oh-ih)/2[v0]")
+    parts.append(f"[1:v]scale={int(postW)}:{H}:flags=lanczos,setsar=1,pad={finalW}:{H}:(ow-iw)/2:(oh-ih)/2[v1]")
+
+    if audio_mode == "concat":
+        # concat video and audio
+        parts.append(f"[v0][0:a?][v1][1:a?]concat=n=2:v=1:a=1[basev][basea]")
+        out_v = "[basev]"
+        out_a = "[basea]"
+    else:
+        # concat video only (a=0)
+        parts.append(f"[v0][v1]concat=n=2:v=1:a=0[base]")
+        out_v = "[base]"
+        out_a = None
+
+    return ";".join(parts), finalW, H, out_v, out_a
 
 
-def make_composite_video(
+# --------------------------
+# Build and run FFmpeg
+# --------------------------
+def assemble_and_run_ffmpeg(
     pre_path: str,
     post_path: str,
     opts: ExportOptions,
-    tmp_dir: str
+    tmpdir: str
 ) -> str:
-    pre = VideoFileClip(pre_path)
-    post = VideoFileClip(post_path)
+    ffmpeg = get_ffmpeg_path()
 
-    # Normalize fps if requested
-    if opts.fps:
-        pre = pre.set_fps(opts.fps)
-        post = post.set_fps(opts.fps)
+    # Probe input sizes
+    pre_w, pre_h = probe_video_dims(pre_path)
+    post_w, post_h = probe_video_dims(post_path)
 
-    # Layouts
-    if opts.layout == "side_by_side":
-        target_h = opts.target_height
-        pre_resized = pre.resize(height=target_h)
-        post_resized = post.resize(height=target_h)
+    # Build base filter by layout
+    divider_hex = rgb_to_ffmpeg_hex(hex_to_rgb_tuple(opts.divider_color))
 
-        pre_w = _safe_int_even(pre_resized.w)
-        post_w = _safe_int_even(post_resized.w)
-        h = _safe_int_even(target_h)
-        pre_resized = pre_resized.resize(newsize=(pre_w, h))
-        post_resized = post_resized.resize(newsize=(post_w, h))
-
-        comp = clips_array([[pre_resized, post_resized]])
-
-        if opts.show_divider:
-            divider_w = max(2, int(0.004 * comp.w))  # ~0.4% of width
-            dc = tuple(int(opts.divider_color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
-            divider_img = np.full((h, divider_w, 3), dc, dtype=np.uint8)
-            divider = ImageClip(divider_img, duration=comp.duration)
-            comp = CompositeVideoClip(
-                [comp, divider.set_position((comp.w // 2 - divider_w // 2, 0))],
-                size=(comp.w, comp.h)
-            )
-
-    elif opts.layout == "stacked":
-        # Match widths, then stack vertically and resize to target height
-        working_w = max(pre.w, post.w)
-        pre_resized = pre.resize(width=working_w)
-        post_resized = post.resize(width=working_w)
-        comp = clips_array([[pre_resized], [post_resized]])
-
-        scale_ratio = opts.target_height / comp.h
-        new_w = _safe_int_even(comp.w * scale_ratio)
-        new_h = _safe_int_even(opts.target_height)
-        comp = comp.resize(newsize=(new_w, new_h))
-
-        if opts.show_divider:
-            divider_h = max(2, int(0.004 * comp.h))
-            dc = tuple(int(opts.divider_color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
-            divider_img = np.full((divider_h, comp.w, 3), dc, dtype=np.uint8)
-            divider = ImageClip(divider_img, duration=comp.duration)
-            comp = CompositeVideoClip(
-                [comp, divider.set_position((0, comp.h // 2 - divider_h // 2))],
-                size=(comp.w, comp.h)
-            )
-
-    elif opts.layout == "sequential":
-        target_h = opts.target_height
-        pre_resized = pre.resize(height=target_h)
-        post_resized = post.resize(height=target_h)
-        pre_resized = pre_resized.resize(newsize=(_safe_int_even(pre_resized.w), _safe_int_even(pre_resized.h)))
-        post_resized = post_resized.resize(newsize=(_safe_int_even(post_resized.w), _safe_int_even(post_resized.h)))
-        comp = concatenate_videoclips([pre_resized, post_resized], method="compose")
-
-    else:
-        pre.close()
-        post.close()
-        raise ValueError("Unknown layout")
-
-    # Cap width if requested
-    if opts.max_width and comp.w > opts.max_width:
-        scale = opts.max_width / comp.w
-        comp = comp.resize(scale)
-
-    # Ensure even final dims
-    final_w = _safe_int_even(comp.w)
-    final_h = _safe_int_even(comp.h)
-    if (final_w != comp.w) or (final_h != comp.h):
-        comp = comp.resize(newsize=(final_w, final_h))
-
-    # Overlay center text
-    if (opts.overlay_text or "").strip():
-        img = _render_center_text_image(
-            text=opts.overlay_text,
-            frame_size=(comp.w, comp.h),
-            font_size=opts.font_size,
-            text_color=opts.text_color,
-            bg_color=opts.text_bg_color,
-            bg_opacity=opts.text_bg_opacity
+    if opts.layout == "sbs":
+        base_filters, out_w, out_h = build_filters_side_by_side(
+            pre_w, pre_h, post_w, post_h, opts.target_height, opts.show_divider, divider_hex
         )
-        text_clip = ImageClip(np.array(img)).set_duration(comp.duration).set_position(("center", "center"))
-        comp = CompositeVideoClip([comp, text_clip], size=(comp.w, comp.h))
+        out_v_label = "[base]"
+        out_a_label = None  # audio mapped later
 
-    # Audio handling
-    if opts.audio_source == "none":
-        comp = comp.without_audio()
-    elif opts.audio_source == "pre":
-        comp = comp.set_audio(pre.audio if pre.audio else None)
-    elif opts.audio_source == "post":
-        comp = comp.set_audio(post.audio if post.audio else None)
-
-    # Export
-    out_path = os.path.join(tmp_dir, "export.mp4")
-    comp.write_videofile(
-        out_path,
-        codec="libx264",
-        audio_codec="aac" if opts.audio_source != "none" else None,
-        fps=opts.fps or comp.fps or 30,
-        threads=os.cpu_count() or 4,
-        temp_audiofile=os.path.join(tmp_dir, "temp-audio.m4a"),
-        remove_temp=True,
-        preset="medium"
-    )
-
-    # Close clips
-    comp.close()
-    pre.close()
-    post.close()
-
-    return out_path
-
-
-# --------------------
-# Streamlit UI
-# --------------------
-st.set_page_config(page_title="Pre/Post Echo Composer", page_icon="🎬", layout="centered")
-
-st.title("🎬 Pre/Post Echo Video Composer")
-st.caption("Upload your Pre Echo and Post Echo videos, choose a layout, add centered text, and export a shareable MP4.")
-
-with st.expander("How it works"):
-    st.write(
-        "- Upload a **Pre** video and a **Post** video.\n"
-        "- Choose a layout: **Side‑by‑Side**, **Stacked**, or **Sequential (Before→After)**.\n"
-        "- Enter overlay text to appear **centered** with a semi‑transparent background.\n"
-        "- Optionally select which audio to keep.\n"
-        "- Export to MP4 and download."
-    )
-
-col1, col2 = st.columns(2)
-with col1:
-    pre_file = st.file_uploader("Upload **Pre Echo** video", type=["mp4", "mov", "m4v", "avi", "webm"])
-with col2:
-    post_file = st.file_uploader("Upload **Post Echo** video", type=["mp4", "mov", "m4v", "avi", "webm"])
-
-layout_label = st.radio(
-    "Layout",
-    options=["Side‑by‑Side", "Stacked", "Sequential (Before→After)"],
-    horizontal=True
-)
-layout_map = {
-    "Side‑by‑Side": "side_by_side",
-    "Stacked": "stacked",
-    "Sequential (Before→After)": "sequential"
-}
-
-overlay_text = st.text_area("Center overlay text", value="PRE vs POST", placeholder="Type the text shown in the middle…")
-
-c1, c2 = st.columns(2)
-with c1:
-    font_size = st.slider("Font size", min_value=24, max_value=96, value=48, step=2)
-    text_color = st.color_picker("Text color", value="#FFFFFF")
-    fps = st.number_input("Output FPS", min_value=1, max_value=120, value=30, step=1)
-with c2:
-    text_bg_color = st.color_picker("Text background color", value="#000000")
-    text_bg_opacity = st.slider("Background opacity", 0.0, 1.0, 0.45, 0.05)
-
-c3, c4 = st.columns(2)
-with c3:
-    show_divider = st.checkbox("Show divider (for side‑by‑side/stacked)", value=True)
-    divider_color = st.color_picker("Divider color", value="#FFFFFF")
-with c4:
-    audio_source_label = st.selectbox("Audio", options=["Keep Pre audio", "Keep Post audio", "Mute"], index=2)
-
-target_height = st.select_slider(
-    "Target height (px)",
-    options=[360, 480, 720, 1080, 1440],
-    value=720
-)
-max_width_choice = st.select_slider(
-    "Max output width (cap)",
-    options=[None, 640, 960, 1280, 1920, 2560],
-    value=1280,
-    format_func=lambda x: "No cap" if x is None else f"{x}px"
-)
-
-export_btn = st.button("🔄 Generate & Export MP4", type="primary", use_container_width=True)
-
-if export_btn:
-    if not pre_file or not post_file:
-        st.error("Please upload both **Pre** and **Post** videos.")
-        st.stop()
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        pre_path = os.path.join(tmpdir, f"pre_{pre_file.name}")
-        post_path = os.path.join(tmpdir, f"post_{post_file.name}")
-        with open(pre_path, "wb") as f:
-            f.write(pre_file.read())
-        with open(post_path, "wb") as f:
-            f.write(post_file.read())
-
-        opts = ExportOptions(
-            layout=layout_map[layout_label],
-            target_height=int(target_height),
-            max_width=None if max_width_choice is None else int(max_width_choice),
-            show_divider=bool(show_divider),
-            divider_color=divider_color,
-            overlay_text=overlay_text or "",
-            font_size=int(font_size),
-            text_color=text_color,
-            text_bg_color=text_bg_color,
-            text_bg_opacity=float(text_bg_opacity),
-            audio_source={"Keep Pre audio": "pre", "Keep Post audio": "post", "Mute": "none"}[audio_source_label],
-            fps=int(fps) if fps else None
+    elif opts.layout == "stack":
+        base_filters, out_w, out_h = build_filters_stacked(
+            pre_w, pre_h, post_w, post_h, opts.target_width, opts.show_divider, divider_hex
         )
+        out_v_label = "[base]"
+        out_a_label = None
 
-        st.info("Processing video… this can take a moment for large files.")
-        try:
-            out_path = make_composite_video(pre_path, post_path, opts, tmpdir)
-        except Exception as e:
-            st.exception(e)
-            st.stop()
-
-        with open(out_path, "rb") as f:
-            data = f.read()
-
-        st.success("Export complete!")
-        st.video(data)
-
-        st.download_button(
-            label="⬇️ Download MP4",
-            data=data,
-            file_name="pre-post-export.mp4",
-            mime="video/mp4",
-            use_container_width=True
-        )
-
-st.markdown("---")
-st.caption("Tip: For faster exports, choose 720p height and cap width to 1280px. You can always re‑export at 1080p if needed.")
+    elif opts.layout == "seq":
+        base_filters, out_w, out_h, out_v_label, out_a_label = build_filters_sequential(
+            pre_w, pre_h, post_w, post_h, opts.target_height, opts.audio_mode
+       
