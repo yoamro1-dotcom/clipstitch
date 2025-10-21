@@ -1,5 +1,4 @@
 import os
-import io
 import math
 import tempfile
 import textwrap
@@ -16,7 +15,6 @@ from moviepy.editor import (
     clips_array,
     concatenate_videoclips,
     ImageClip,
-    AudioFileClip
 )
 
 
@@ -28,9 +26,9 @@ def _safe_int_even(x: int) -> int:
     x = int(max(2, round(x)))
     return x if x % 2 == 0 else x - 1
 
+
 def _load_font(font_size: int) -> ImageFont.FreeTypeFont:
     """Attempt to load a decent font; fall back to default if not available."""
-    # Common fonts that are often present on Linux/Streamlit Cloud
     candidate_paths = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -42,8 +40,8 @@ def _load_font(font_size: int) -> ImageFont.FreeTypeFont:
                 return ImageFont.truetype(p, font_size)
             except Exception:
                 pass
-    # Fallback
     return ImageFont.load_default()
+
 
 def _render_center_text_image(
     text: str,
@@ -56,7 +54,9 @@ def _render_center_text_image(
     padding_px: int = 24,
     line_spacing: float = 1.1,
 ) -> Image.Image:
-    """Create an RGBA image with centered text and semi-transparent rounded rect."""
+    """
+    Create an RGBA image with centered text and a semi-transparent rounded rectangle behind it.
+    """
     w, h = frame_size
     W = int(w * max_width_ratio)
 
@@ -64,13 +64,17 @@ def _render_center_text_image(
 
     # Wrap text to fit width W
     # Approximate wrap width by measuring average char width
-    avg_char_w = font.getbbox("M")[2]  # width of "M"
-    if avg_char_w <= 0:
-        avg_char_w = font_size * 0.6
+    try:
+        bbox_M = font.getbbox("M")
+        avg_char_w = max(1, bbox_M[2] - bbox_M[0])
+    except Exception:
+        avg_char_w = max(1, int(font_size * 0.6))
+
     max_chars = max(1, int(W / avg_char_w))
     wrapped = []
     for para in text.split("\n"):
-        wrapped.extend(textwrap.wrap(para, width=max_chars) or [""])
+        lines = textwrap.wrap(para, width=max_chars)
+        wrapped.extend(lines if lines else [""])
 
     # Measure text block
     draw_dummy = ImageDraw.Draw(Image.new("RGB", (10, 10)))
@@ -80,13 +84,16 @@ def _render_center_text_image(
         bbox = draw_dummy.textbbox((0, 0), line, font=font)
         line_widths.append(bbox[2] - bbox[0])
         line_heights.append(bbox[3] - bbox[1])
+
     if not line_heights:
         line_heights = [font_size]
         line_widths = [font_size]
 
     text_block_w = max(line_widths)
+    text_block_h = sum(line_heights)
     # Add spacing between lines
-    text_block_h = sum(line_heights) + int((len(line_heights) - 1) * font_size * (line_spacing - 1.0))
+    if len(line_heights) > 1:
+        text_block_h += int((len(line_heights) - 1) * font_size * (line_spacing - 1.0))
 
     # Create transparent canvas
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -102,41 +109,39 @@ def _render_center_text_image(
     radius = int(min(rect_w, rect_h) * 0.12)
 
     # Convert bg_color hex to RGBA with opacity
-    bg_color = bg_color.lstrip("#")
-    r = int(bg_color[0:2], 16)
-    g = int(bg_color[2:4], 16)
-    b = int(bg_color[4:6], 16)
+    bg_hex = bg_color.lstrip("#")
+    r = int(bg_hex[0:2], 16)
+    g = int(bg_hex[2:4], 16)
+    b = int(bg_hex[4:6], 16)
     a = int(max(0, min(255, round(255 * bg_opacity))))
 
-    # Rounded rectangle
     try:
         draw.rounded_rectangle([rect_x0, rect_y0, rect_x1, rect_y1], radius=radius, fill=(r, g, b, a))
     except Exception:
-        # Fallback to normal rectangle if rounded not supported
         draw.rectangle([rect_x0, rect_y0, rect_x1, rect_y1], fill=(r, g, b, a))
 
     # Draw wrapped text
-    text_color = text_color.lstrip("#")
-    tr = int(text_color[0:2], 16)
-    tg = int(text_color[2:4], 16)
-    tb = int(text_color[4:6], 16)
+    txt_hex = text_color.lstrip("#")
+    tr = int(txt_hex[0:2], 16)
+    tg = int(txt_hex[2:4], 16)
+    tb = int(txt_hex[4:6], 16)
+
     tx = rect_x0 + padding_px
     ty = rect_y0 + padding_px
 
     for i, line in enumerate(wrapped):
         draw.text((tx, ty), line, font=font, fill=(tr, tg, tb, 255))
-        # Move down for next line
         line_h = line_heights[i]
         ty += int(line_h * line_spacing)
 
     return img
 
+
 @dataclass
 class ExportOptions:
     layout: str               # 'side_by_side' | 'stacked' | 'sequential'
-    target_height: int        # final output height (auto width), or vice versa
+    target_height: int        # final output height
     max_width: Optional[int]  # optional cap on width
-    bg_color: str
     show_divider: bool
     divider_color: str
     overlay_text: str
@@ -157,19 +162,17 @@ def make_composite_video(
     pre = VideoFileClip(pre_path)
     post = VideoFileClip(post_path)
 
-    # Normalize fps if requested (helps with odd encodes)
+    # Normalize fps if requested
     if opts.fps:
         pre = pre.set_fps(opts.fps)
         post = post.set_fps(opts.fps)
 
-    # Decide layout
+    # Layouts
     if opts.layout == "side_by_side":
-        # Match heights, stack horizontally
         target_h = opts.target_height
         pre_resized = pre.resize(height=target_h)
         post_resized = post.resize(height=target_h)
 
-        # Ensure even widths
         pre_w = _safe_int_even(pre_resized.w)
         post_w = _safe_int_even(post_resized.w)
         h = _safe_int_even(target_h)
@@ -177,59 +180,53 @@ def make_composite_video(
         post_resized = post_resized.resize(newsize=(post_w, h))
 
         comp = clips_array([[pre_resized, post_resized]])
-        # Optional divider
+
         if opts.show_divider:
             divider_w = max(2, int(0.004 * comp.w))  # ~0.4% of width
-            divider = ImageClip(np.full((h, divider_w, 3), 0, dtype=np.uint8), duration=comp.duration)
-            # Colorize divider
             dc = tuple(int(opts.divider_color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
-            divider = divider.on_color(size=(divider_w, h), color=dc, pos=('center', 'center'))
-            # Overlay divider at center x
-            comp = CompositeVideoClip([
-                comp,
-                divider.set_position((comp.w // 2 - divider_w // 2, 0))
-            ], size=(comp.w, comp.h), bg_color=None)
+            divider_img = np.full((h, divider_w, 3), dc, dtype=np.uint8)
+            divider = ImageClip(divider_img, duration=comp.duration)
+            comp = CompositeVideoClip(
+                [comp, divider.set_position((comp.w // 2 - divider_w // 2, 0))],
+                size=(comp.w, comp.h)
+            )
 
     elif opts.layout == "stacked":
-        # Match widths, stack vertically
-        target_h = opts.target_height
-        # First, set a working width from pre clip to maintain aspect
-        working_w = pre.w
+        # Match widths, then stack vertically and resize to target height
+        working_w = max(pre.w, post.w)
         pre_resized = pre.resize(width=working_w)
         post_resized = post.resize(width=working_w)
         comp = clips_array([[pre_resized], [post_resized]])
 
-        # Then scale final composite to target height if provided
-        scale_ratio = target_h / comp.h
+        scale_ratio = opts.target_height / comp.h
         new_w = _safe_int_even(comp.w * scale_ratio)
-        new_h = _safe_int_even(target_h)
+        new_h = _safe_int_even(opts.target_height)
         comp = comp.resize(newsize=(new_w, new_h))
 
         if opts.show_divider:
             divider_h = max(2, int(0.004 * comp.h))
             dc = tuple(int(opts.divider_color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
-            divider = ImageClip(np.full((divider_h, comp.w, 3), 0, dtype=np.uint8), duration=comp.duration)
-            divider = divider.on_color(size=(comp.w, divider_h), color=dc, pos=('center', 'center'))
-            comp = CompositeVideoClip([
-                comp,
-                divider.set_position((0, comp.h // 2 - divider_h // 2))
-            ], size=(comp.w, comp.h), bg_color=None)
+            divider_img = np.full((divider_h, comp.w, 3), dc, dtype=np.uint8)
+            divider = ImageClip(divider_img, duration=comp.duration)
+            comp = CompositeVideoClip(
+                [comp, divider.set_position((0, comp.h // 2 - divider_h // 2))],
+                size=(comp.w, comp.h)
+            )
 
     elif opts.layout == "sequential":
-        # Play pre then post
-        # Resize both to same height
         target_h = opts.target_height
         pre_resized = pre.resize(height=target_h)
         post_resized = post.resize(height=target_h)
-        # Ensure even dims
         pre_resized = pre_resized.resize(newsize=(_safe_int_even(pre_resized.w), _safe_int_even(pre_resized.h)))
         post_resized = post_resized.resize(newsize=(_safe_int_even(post_resized.w), _safe_int_even(post_resized.h)))
         comp = concatenate_videoclips([pre_resized, post_resized], method="compose")
 
     else:
+        pre.close()
+        post.close()
         raise ValueError("Unknown layout")
 
-    # Cap width if requested (for performance)
+    # Cap width if requested
     if opts.max_width and comp.w > opts.max_width:
         scale = opts.max_width / comp.w
         comp = comp.resize(scale)
@@ -240,8 +237,8 @@ def make_composite_video(
     if (final_w != comp.w) or (final_h != comp.h):
         comp = comp.resize(newsize=(final_w, final_h))
 
-    # Overlay center text (full duration)
-    if opts.overlay_text.strip():
+    # Overlay center text
+    if (opts.overlay_text or "").strip():
         img = _render_center_text_image(
             text=opts.overlay_text,
             frame_size=(comp.w, comp.h),
@@ -273,8 +270,12 @@ def make_composite_video(
         remove_temp=True,
         preset="medium"
     )
-    # Close clips to free resources
-    comp.close(); pre.close(); post.close()
+
+    # Close clips
+    comp.close()
+    pre.close()
+    post.close()
+
     return out_path
 
 
@@ -301,12 +302,12 @@ with col1:
 with col2:
     post_file = st.file_uploader("Upload **Post Echo** video", type=["mp4", "mov", "m4v", "avi", "webm"])
 
-layout = st.radio(
+layout_label = st.radio(
     "Layout",
     options=["Side‑by‑Side", "Stacked", "Sequential (Before→After)"],
     horizontal=True
 )
-map_layout = {
+layout_map = {
     "Side‑by‑Side": "side_by_side",
     "Stacked": "stacked",
     "Sequential (Before→After)": "sequential"
@@ -318,7 +319,7 @@ c1, c2 = st.columns(2)
 with c1:
     font_size = st.slider("Font size", min_value=24, max_value=96, value=48, step=2)
     text_color = st.color_picker("Text color", value="#FFFFFF")
-    fps = st.number_input("Output FPS (optional)", min_value=1, max_value=120, value=30, step=1)
+    fps = st.number_input("Output FPS", min_value=1, max_value=120, value=30, step=1)
 with c2:
     text_bg_color = st.color_picker("Text background color", value="#000000")
     text_bg_opacity = st.slider("Background opacity", 0.0, 1.0, 0.45, 0.05)
@@ -328,10 +329,19 @@ with c3:
     show_divider = st.checkbox("Show divider (for side‑by‑side/stacked)", value=True)
     divider_color = st.color_picker("Divider color", value="#FFFFFF")
 with c4:
-    audio_source = st.selectbox("Audio", options=["Keep Pre audio", "Keep Post audio", "Mute"], index=2)
+    audio_source_label = st.selectbox("Audio", options=["Keep Pre audio", "Keep Post audio", "Mute"], index=2)
 
-target_height = st.select_slider("Target height (px)", options=[360, 480, 720, 1080, 1440], value=720)
-max_width = st.select_slider("Max output width (cap)", options=[None, 640, 960, 1280, 1920, 2560], value=1280, format_func=lambda x: "No cap" if x is None else f"{x}px")
+target_height = st.select_slider(
+    "Target height (px)",
+    options=[360, 480, 720, 1080, 1440],
+    value=720
+)
+max_width_choice = st.select_slider(
+    "Max output width (cap)",
+    options=[None, 640, 960, 1280, 1920, 2560],
+    value=1280,
+    format_func=lambda x: "No cap" if x is None else f"{x}px"
+)
 
 export_btn = st.button("🔄 Generate & Export MP4", type="primary", use_container_width=True)
 
@@ -340,7 +350,6 @@ if export_btn:
         st.error("Please upload both **Pre** and **Post** videos.")
         st.stop()
 
-    # Persist uploads to temp files
     with tempfile.TemporaryDirectory() as tmpdir:
         pre_path = os.path.join(tmpdir, f"pre_{pre_file.name}")
         post_path = os.path.join(tmpdir, f"post_{post_file.name}")
@@ -350,10 +359,9 @@ if export_btn:
             f.write(post_file.read())
 
         opts = ExportOptions(
-            layout=map_layout[layout],
+            layout=layout_map[layout_label],
             target_height=int(target_height),
-            max_width=None if max_width is None else int(max_width),
-            bg_color="#000000",
+            max_width=None if max_width_choice is None else int(max_width_choice),
             show_divider=bool(show_divider),
             divider_color=divider_color,
             overlay_text=overlay_text or "",
@@ -361,7 +369,7 @@ if export_btn:
             text_color=text_color,
             text_bg_color=text_bg_color,
             text_bg_opacity=float(text_bg_opacity),
-            audio_source={"Keep Pre audio": "pre", "Keep Post audio": "post", "Mute": "none"}[audio_source],
+            audio_source={"Keep Pre audio": "pre", "Keep Post audio": "post", "Mute": "none"}[audio_source_label],
             fps=int(fps) if fps else None
         )
 
@@ -372,7 +380,6 @@ if export_btn:
             st.exception(e)
             st.stop()
 
-        # Load and offer download
         with open(out_path, "rb") as f:
             data = f.read()
 
@@ -388,5 +395,4 @@ if export_btn:
         )
 
 st.markdown("---")
-st.caption("Tip: For faster exports, choose 720p height and cap width to 1280px. You can always re-export at 1080p if needed.")
-``
+st.caption("Tip: For faster exports, choose 720p height and cap width to 1280px. You can always re‑export at 1080p if needed.")
