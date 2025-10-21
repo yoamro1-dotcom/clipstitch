@@ -1,5 +1,6 @@
-streamlit>=1.37
-moviepy>=1.0.3
+streamlit>=1.38
+moviepy>=2.0.0
+imageio>=2.34
 imageio-ffmpeg>=0.4.9
 Pillow>=10.0.0
 numpy>=1.24
